@@ -1,0 +1,9 @@
+build/
+models/
+.venv/
+__pycache__/
+*.cache
+*.cache.tmp
+# reference logits are ~100 MB; regenerate with tools/reference.py
+tests/data/*.bin
+.DS_Store
