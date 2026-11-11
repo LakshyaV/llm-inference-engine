@@ -142,3 +142,47 @@ kernel void gemm_tiled(device const REAL* A [[buffer(0)]],
     for (uint r = 0; r < 4 && i0 + r < g.M; r++)
         for (uint q = 0; q < 4 && j0 + q < g.N; q++) C[g.c_off + (i0 + r) * g.ldc + j0 + q] = c[r][q];
 }
+
+// ---------------------------------------------------------------------------
+// Tensor-core path. Apple GPUs from the M5/A19 generation expose their matrix
+// units to shaders through Metal Performance Primitives: a threadgroup of
+// SIMD-groups cooperatively multiplies a tile, exactly like a warp driving a
+// tensor core with WMMA. We wrap raw buffers in inline tensors (no MTLTensor
+// objects) and tile C into TM x TN blocks, one threadgroup each.
+//
+// Tensor extents are innermost-first: a row-major [rows, cols] matrix is a
+// tensor of extents (cols, rows).
+// ---------------------------------------------------------------------------
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace mpp::tensor_ops;
+
+#ifndef TM
+#define TM 64
+#endif
+#ifndef TN
+#define TN 32
+#endif
+#ifndef NSG
+#define NSG 4
+#endif
+
+typedef tensor<device REAL, dextents<int, 2>, tensor_inline> in_tensor;
+typedef tensor<device CREAL, dextents<int, 2>, tensor_inline> out_tensor;
+
+kernel void gemm_mpp(device REAL* A [[buffer(0)]],
+                     device REAL* B [[buffer(1)]],
+                     device CREAL* C [[buffer(2)]],
+                     constant GemmArgs& g [[buffer(3)]],
+                     uint2 tg [[threadgroup_position_in_grid]]) {
+    constexpr auto desc = matmul2d_descriptor(TM, TN, static_cast<int>(dynamic_extent), false, true, RELAXED);
+    matmul2d<desc, execution_simdgroups<NSG>> op;
+
+    in_tensor tA(A + g.a_off, dextents<int, 2>(g.K, g.M), array<int, 2>{1, int(g.lda)});
+    in_tensor tB(B + g.b_off, dextents<int, 2>(g.K, g.N), array<int, 2>{1, int(g.ldb)});
+    out_tensor tC(C + g.c_off, dextents<int, 2>(g.N, g.M), array<int, 2>{1, int(g.ldc)});
+
+    auto mA = tA.slice(0, int(tg.y * TM));
+    auto mB = tB.slice(0, int(tg.x * TN));
+    auto mC = tC.slice(int(tg.x * TN), int(tg.y * TM));
+    op.run(mA, mB, mC);
+}
