@@ -294,3 +294,123 @@ kernel void rope_kv_write(device float* QKV [[buffer(0)]],
     }
 }
 
+// ------------------------------------------------ fused flash attention ---
+//
+// One threadgroup computes one (token, head) output: QK^T, causal softmax and
+// the weighted sum of V in a single pass over the cached keys, never
+// materialising the score matrix.
+//
+// A GPU thread is slow on its own, so the work is spread over ATT_SGS
+// SIMD-groups. Keys are consumed in tiles of one key per thread:
+//   1. every thread scores one key (q is staged once in threadgroup memory)
+//   2. the tile max joins the running max (online softmax); running sum and
+//      accumulators are rescaled by exp(m_old - m_new)
+//   3. scores become probabilities in the shared tile; then every thread owns
+//      one float4 slice of the output and a subset of the keys, and
+//      accumulates p_j * V_j for them
+// After the last tile the per-subset partial sums are reduced through
+// threadgroup memory. The causal mask is implicit: a token at position p only
+// walks keys [0, p]. Keys/values are fetched through the page table, so
+// sequences can live in arbitrary, non-contiguous pages of the pool.
+
+template <uint ATT_SGS>
+static inline void attention_impl(device const float* QKV, device const float* Kc, device const float* Vc,
+                                  device ACT_T* OUT, device const TokenMeta* meta, device const uint* page_table,
+                                  constant KVArgs& a, uint3 tg, ushort lane, ushort sg,
+                                  threadgroup float4* qs, threadgroup float* score, threadgroup float* red,
+                                  threadgroup float4* part) {
+    const uint ATT_THREADS = ATT_SGS * SG;
+
+    const uint h = tg.x, n = tg.y;
+    const uint tid = uint(sg) * SG + lane;
+    const uint HD4 = a.head_dim / 4;
+    const uint chunk = tid % HD4;             // which float4 of the output this thread owns
+    const uint subset = tid / HD4;            // which residue class of keys it accumulates
+    const uint n_subsets = ATT_THREADS / HD4;
+    const uint kh = h / (a.n_heads / a.n_kv);
+    const TokenMeta m = meta[n];
+    const uint nkeys = m.pos + 1;
+
+    if (tid < HD4) qs[tid] = ((device const packed_float4*)(QKV + n * a.qkv_stride + h * a.head_dim))[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float run_max = -1e30f, run_sum = 0;
+    float4 acc = 0;
+    for (uint j0 = 0; j0 < nkeys; j0 += ATT_THREADS) {
+        const uint jn = min(ATT_THREADS, nkeys - j0);
+
+        // 1. score one key
+        float s = -1e30f;
+        if (tid < jn) {
+            device const packed_float4* k =
+                (device const packed_float4*)(Kc + kv_slot(a, page_table, m.seq, j0 + tid) + kh * a.head_dim);
+            s = 0;
+            for (uint e = 0; e < HD4; e++) s += dot(qs[e], float4(k[e]));
+            s *= a.scale;
+            score[tid] = s;
+        }
+        const float sg_max = simd_max(s);
+        if (lane == 0) red[sg] = sg_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2. online-softmax rescale
+        float new_max = run_max;
+        for (uint i = 0; i < ATT_SGS; i++) new_max = max(new_max, red[i]);
+        const float corr = exp(run_max - new_max);
+        acc *= corr;
+        run_sum *= corr;
+        run_max = new_max;
+
+        // 3a. score -> probability
+        float p = 0;
+        if (tid < jn) {
+            p = exp(s - new_max);
+            score[tid] = p;
+        }
+        const float sg_sum = simd_sum(p);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) red[sg] = sg_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < ATT_SGS; i++) run_sum += red[i];
+
+        // 3b. accumulate this thread's slice over its subset of keys
+        for (uint j = subset; j < jn; j += n_subsets) {
+            device const packed_float4* v =
+                (device const packed_float4*)(Vc + kv_slot(a, page_table, m.seq, j0 + j) + kh * a.head_dim);
+            acc += score[j] * float4(v[chunk]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    part[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < HD4) {
+        float4 total = 0;
+        for (uint i = 0; i < n_subsets; i++) total += part[i * HD4 + tid];
+        ((device ACT4*)(OUT + n * a.d + h * a.head_dim))[tid] = ACT4(total / run_sum);
+    }
+}
+
+// Several group widths: wide groups for decode (few tokens, long key lists, so
+// spend threads on parallelism) down to a single SIMD-group for prefill and
+// big batches (thousands of groups already fill the GPU; small ones launch
+// faster). The engine picks by batch size and context length.
+#define ATTENTION_KERNEL(NAME, SGS)                                                                            \
+    kernel void NAME(device const float* QKV [[buffer(0)]], device const float* Kc [[buffer(1)]],             \
+                     device const float* Vc [[buffer(2)]], device ACT_T* OUT [[buffer(3)]],                   \
+                     device const TokenMeta* meta [[buffer(4)]], device const uint* page_table [[buffer(5)]], \
+                     constant KVArgs& a [[buffer(6)]], uint3 tg [[threadgroup_position_in_grid]],             \
+                     ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { \
+        threadgroup float4 qs[64]; /* head_dim <= 256 */                                                       \
+        threadgroup float score[SGS * SG];                                                                     \
+        threadgroup float red[SGS];                                                                            \
+        threadgroup float4 part[SGS * SG];                                                                     \
+        attention_impl<SGS>(QKV, Kc, Vc, OUT, meta, page_table, a, tg, lane, sg, qs, score, red, part);        \
+    }
+
+ATTENTION_KERNEL(attention_sg1, 1)
+ATTENTION_KERNEL(attention_sg2, 2)
+ATTENTION_KERNEL(attention_sg4, 4)
+ATTENTION_KERNEL(attention_sg8, 8)
+ATTENTION_KERNEL(attention_sg16, 16)
+ATTENTION_KERNEL(attention_sg32, 32)
