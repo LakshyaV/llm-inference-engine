@@ -2,13 +2,16 @@
 //
 //   llm generate -m <model_dir> -p "prompt" [-n 128] [--chat] [--f32] [--temp 0.7 --top-k 40 --top-p 0.95]
 //   llm bench    -m <model_dir> [-n 128] [--prompt-tokens 512] [--ctx 1] [--profile] [--f32]
+//   llm batch    -m <model_dir> [--requests 16] [--max-active 8] [-n 96] [--arrival-ms 0]
 #include <cstdio>
 #include <cstring>
+#include <unistd.h>
 #include <map>
 #include <string>
 
 #include "../src/engine.h"
 #include "../src/sampler.h"
+#include "../src/scheduler.h"
 #include "../src/tokenizer.h"
 #include "../src/util.h"
 
@@ -143,12 +146,89 @@ static int cmd_bench(const Args& a) {
     return 0;
 }
 
+static const char* kPrompts[] = {
+    "Explain how a hash map works.",
+    "Write a short poem about the ocean.",
+    "What causes the seasons on Earth?",
+    "Give me three tips for writing clean code.",
+    "Summarize the plot of Romeo and Juliet in a paragraph.",
+    "How does a transformer neural network process text?",
+    "What is the difference between TCP and UDP?",
+    "Describe how photosynthesis works.",
+    "Write a Python function that reverses a linked list.",
+    "Why is the sky dark at night?",
+    "Explain the rules of chess to a beginner.",
+    "What were the main causes of the First World War?",
+    "How do vaccines train the immune system?",
+    "Explain what a derivative is in calculus.",
+    "Describe the water cycle.",
+    "What is the purpose of an operating system kernel?",
+};
+
+// Continuous batching demo: the same requests served one at a time and then
+// concurrently, optionally arriving over time (--arrival-ms).
+static int cmd_batch(const Args& a) {
+    const std::string dir = a.str("model");
+    Tokenizer tok(dir + "/tokenizer.json");
+    EngineOptions eo = engine_options(a);
+    eo.max_seqs = 64;
+    eo.n_pages = 1024;
+    Engine eng(dir, eo);
+    const int n_req = a.num("requests", 16), max_tokens = a.num("max-tokens", 96);
+    const double arrival = a.real("arrival-ms", 0) / 1e3;
+
+    auto serve = [&](int max_active, bool print) {
+        SchedulerConfig sc;
+        sc.max_active = max_active;
+        Scheduler sched(eng, sc);
+        const double t0 = now_sec();
+        int submitted = 0;
+        while (true) {
+            // Requests arrive on a fixed schedule, independent of how busy the engine is.
+            while (submitted < n_req && now_sec() - t0 >= submitted * arrival) {
+                Request r;
+                r.prompt = tok.encode(chat_prompt(kPrompts[submitted % (sizeof kPrompts / sizeof *kPrompts)]));
+                r.max_tokens = max_tokens;
+                sched.submit(std::move(r));
+                submitted++;
+            }
+            if (!sched.step()) {
+                if (submitted == n_req) break;
+                usleep(200);
+            }
+        }
+        const double wall = now_sec() - t0;
+        long gen = 0;
+        double ttft = 0, latency = 0;
+        for (int i = 0; i < n_req; i++) {
+            const RequestResult& r = sched.result(i);
+            gen += (long)r.tokens.size();
+            ttft += r.t_first - r.t_submit;
+            latency += r.t_done - r.t_submit;
+        }
+        printf("max_active=%-3d %6ld tokens in %6.2fs  %7.1f tok/s | %4d passes | mean TTFT %6.0f ms | mean latency %6.0f ms\n",
+               max_active, gen, wall, gen / wall, sched.steps(), 1e3 * ttft / n_req, 1e3 * latency / n_req);
+        if (print)
+            for (int i = 0; i < std::min(n_req, 2); i++)
+                printf("--- request %d ---\n%s\n", i, tok.decode(sched.result(i).tokens).c_str());
+    };
+
+    printf("%d requests, up to %d new tokens each, arrival every %.0f ms\n", n_req, max_tokens, arrival * 1e3);
+    serve(1, false);  // warm-up
+    serve(1, false);
+    for (int m : {2, 4, 8, 16, 32})
+        if (m <= std::max(2, a.num("max-active", 32))) serve(m, false);
+    if (a.flag("print")) serve(a.num("max-active", 8), true);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     try {
         Args a = parse(argc, argv);
         if (a.cmd == "generate") return cmd_generate(a);
         if (a.cmd == "bench") return cmd_bench(a);
-        fprintf(stderr, "usage: llm <generate|bench> -m <model_dir> [options]\n");
+        if (a.cmd == "batch") return cmd_batch(a);
+        fprintf(stderr, "usage: llm <generate|bench|batch> -m <model_dir> [options]\n");
         return 2;
     } catch (const std::exception& e) {
         fprintf(stderr, "error: %s\n", e.what());
