@@ -3,6 +3,7 @@
 //   llm generate -m <model_dir> -p "prompt" [-n 128] [--chat] [--f32] [--temp 0.7 --top-k 40 --top-p 0.95]
 //   llm bench    -m <model_dir> [-n 128] [--prompt-tokens 512] [--ctx 1] [--profile] [--f32]
 //   llm batch    -m <model_dir> [--requests 16] [--max-active 8] [-n 96] [--arrival-ms 0]
+//   llm spec     -m <target_dir> --draft <draft_dir> [-p "prompt"] [--gamma 4] [-n 128] [--temp 0]
 #include <cstdio>
 #include <cstring>
 #include <unistd.h>
@@ -12,6 +13,7 @@
 #include "../src/engine.h"
 #include "../src/sampler.h"
 #include "../src/scheduler.h"
+#include "../src/speculative.h"
 #include "../src/tokenizer.h"
 #include "../src/util.h"
 
@@ -222,13 +224,79 @@ static int cmd_batch(const Args& a) {
     return 0;
 }
 
+static int cmd_spec(const Args& a) {
+    const std::string dir = a.str("model"), ddir = a.str("draft");
+    if (ddir.empty()) die("spec: --draft <model_dir> is required");
+    Tokenizer tok(dir + "/tokenizer.json");
+    Engine target(dir, engine_options(a));
+    Engine draft(ddir, engine_options(a));
+    SamplerConfig sc;
+    sc.temperature = (float)a.real("temp", 0.0);
+    sc.top_k = a.num("top-k", 0);
+    sc.top_p = (float)a.real("top-p", 1.0);
+    sc.seed = (uint64_t)a.num("seed", 0);
+    const int max_tokens = a.num("max-tokens", 128), vocab = target.config().vocab_size;
+
+    std::vector<std::string> prompts;
+    if (a.flag("prompt")) prompts.push_back(a.str("prompt"));
+    else for (int i = 0; i < 8; i++) prompts.push_back(kPrompts[i]);
+
+    auto plain = [&](const std::vector<int>& ids) {
+        Sampler sampler(sc);
+        const int seq = target.seq_create();
+        std::vector<TokenIn> toks;
+        for (int id : ids) toks.push_back({id, seq});
+        const float* logits = target.forward(toks, {(int)toks.size() - 1});
+        std::vector<int> out;
+        while ((int)out.size() < max_tokens) {
+            const int next = sampler.sample(logits, vocab);
+            if (is_eos(target.config(), next)) break;
+            out.push_back(next);
+            logits = target.forward({{next, seq}}, {0});
+        }
+        target.seq_free(seq);
+        return out;
+    };
+
+    for (int gamma : a.flag("gamma") ? std::vector<int>{a.num("gamma", 4)} : std::vector<int>{2, 4, 6, 8}) {
+        SpeculativeDecoder spec(target, draft, gamma, sc);
+        double t_plain = 0, t_spec = 0;
+        long n_plain = 0, n_spec = 0, drafted = 0, accepted = 0, passes = 0;
+        int identical = 0;
+        for (size_t i = 0; i < prompts.size(); i++) {
+            const std::vector<int> ids = tok.encode(chat_prompt(prompts[i]));
+            if (i == 0) { plain(ids); spec.generate(ids, 8); }  // warm-up
+            double t0 = now_sec();
+            const std::vector<int> ref = plain(ids);
+            t_plain += now_sec() - t0;
+            t0 = now_sec();
+            const std::vector<int> out = spec.generate(ids, max_tokens);
+            t_spec += now_sec() - t0;
+            n_plain += (long)ref.size();
+            n_spec += (long)out.size();
+            drafted += spec.stats().drafted;
+            accepted += spec.stats().accepted;
+            passes += spec.stats().target_passes;
+            identical += out == ref;
+            if (a.flag("print") && i == 0) printf("%s\n", tok.decode(out).c_str());
+        }
+        printf("gamma=%d  plain %6.1f tok/s | speculative %6.1f tok/s (%.2fx) | acceptance %4.1f%% | %.2f tokens per target pass",
+               gamma, n_plain / t_plain, n_spec / t_spec, (n_spec / t_spec) / (n_plain / t_plain),
+               100.0 * accepted / std::max(1L, drafted), (double)n_spec / std::max(1L, passes));
+        if (sc.temperature <= 0) printf(" | identical to plain greedy: %d/%zu", identical, prompts.size());
+        printf("\n");
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     try {
         Args a = parse(argc, argv);
         if (a.cmd == "generate") return cmd_generate(a);
         if (a.cmd == "bench") return cmd_bench(a);
         if (a.cmd == "batch") return cmd_batch(a);
-        fprintf(stderr, "usage: llm <generate|bench|batch> -m <model_dir> [options]\n");
+        if (a.cmd == "spec") return cmd_spec(a);
+        fprintf(stderr, "usage: llm <generate|bench|batch|spec> -m <model_dir> [options]\n");
         return 2;
     } catch (const std::exception& e) {
         fprintf(stderr, "error: %s\n", e.what());
