@@ -25,6 +25,14 @@ struct SpecStats {
     double acceptance() const { return drafted ? (double)accepted / drafted : 0; }
 };
 
+// One verification step of speculative sampling. `x` was drawn from the draft
+// distribution q; p is the target distribution for the same position.
+// Returns true if x is accepted. Otherwise `replacement` is drawn from the
+// residual norm(max(0, p - q)), which makes the emitted token exactly
+// p-distributed (tests/test_speculative.cpp checks this empirically).
+bool speculative_accept(const std::vector<float>& p, const std::vector<float>& q, int x, Sampler& sampler,
+                        int& replacement);
+
 class SpeculativeDecoder {
 public:
     SpeculativeDecoder(Engine& target, Engine& draft, int gamma, const SamplerConfig& sampling = {});

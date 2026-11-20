@@ -4,6 +4,21 @@
 
 #include "util.h"
 
+bool speculative_accept(const std::vector<float>& p, const std::vector<float>& q, int x, Sampler& sampler,
+                        int& replacement) {
+    if (sampler.uniform() * q[x] < p[x]) return true;  // accept with probability min(1, p/q)
+    std::vector<float> resid(p.size());
+    double sum = 0;
+    for (size_t v = 0; v < p.size(); v++) sum += (resid[v] = std::max(0.0f, p[v] - q[v]));
+    if (sum > 0) {
+        for (auto& r : resid) r = (float)(r / sum);
+        replacement = sampler.draw(resid);
+    } else {
+        replacement = sampler.draw(p);  // p == q up to rounding
+    }
+    return false;
+}
+
 SpeculativeDecoder::SpeculativeDecoder(Engine& target, Engine& draft, int gamma, const SamplerConfig& sampling)
     : target_(target), draft_(draft), gamma_(gamma), sampler_(sampling) {
     if (target.config().vocab_size != draft.config().vocab_size) die("speculative: models must share a vocabulary");
@@ -33,7 +48,7 @@ std::vector<int> SpeculativeDecoder::generate(const std::vector<int>& prompt, in
     std::vector<int> out;
     std::vector<int> x(gamma_);
     std::vector<std::vector<float>> q(greedy ? 0 : gamma_);
-    std::vector<float> p, resid;
+    std::vector<float> p;
     bool stop = false;
 
     auto emit = [&](int tok) {
@@ -82,19 +97,7 @@ std::vector<int> SpeculativeDecoder::generate(const std::vector<int>& prompt, in
                 if (best != xi) { next = best; break; }
             } else {
                 sampler_.distribution(row, V, p);
-                const float px = p[xi], qx = q[n_acc][xi];
-                if (sampler_.uniform() * qx >= px) {  // reject with prob 1 - min(1, p/q)
-                    resid.resize(V);
-                    double sum = 0;
-                    for (int v = 0; v < V; v++) sum += (resid[v] = std::max(0.0f, p[v] - q[n_acc][v]));
-                    if (sum > 0) {
-                        for (int v = 0; v < V; v++) resid[v] = (float)(resid[v] / sum);
-                        next = sampler_.draw(resid);
-                    } else {
-                        next = sampler_.draw(p);
-                    }
-                    break;
-                }
+                if (!speculative_accept(p, q[n_acc], xi, sampler_, next)) break;
             }
         }
         if (next < 0) next = sampler_.sample(tl + (size_t)gamma * V, V);  // all accepted: bonus token
