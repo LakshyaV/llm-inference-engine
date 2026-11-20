@@ -19,7 +19,8 @@ int main(int argc, char** argv) {
         std::vector<int> want;
         for (auto& v : c["ids"].arr) want.push_back((int)v.as_int());
         std::vector<int> got = tok.encode(text);
-        bool ok = got == want && tok.decode(got) == text;
+        // Text that is already NFC must also survive the decode round trip.
+        bool ok = got == want && (nfc_normalize(text) != text || tok.decode(got) == text);
         if (!ok) {
             fail++;
             printf("FAIL\n  want: [%zu]", want.size());

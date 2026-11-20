@@ -1,7 +1,7 @@
 // Byte-level BPE tokenizer compatible with Hugging Face `tokenizer.json`
 // files that use the GPT-2/tiktoken-style scheme (Qwen2.5, Llama-3, GPT-2).
 //
-// Pipeline: split out added/special tokens -> regex pre-tokenization
+// Pipeline: split out added/special tokens -> NFC normalization -> regex pre-tokenization
 // (hand-written matcher, see pretokenize()) -> byte-level BPE merges.
 #pragma once
 #include <cstdint>
@@ -9,6 +9,9 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+// Unicode NFC normalization of UTF-8 text (malformed input is returned unchanged).
+std::string nfc_normalize(std::string_view text);
 
 class Tokenizer {
 public:
@@ -40,6 +43,7 @@ private:
     std::vector<Added> added_;                                  // sorted longest first
     bool added_first_[256] = {};                                // first bytes of added tokens
     int byte_ids_[256];
+    bool nfc_ = false;             // normalizer: NFC
     bool digits_grouped_ = false;  // \p{N}{1,3} (Llama-3) vs \p{N} (Qwen/GPT-2 style)
     mutable std::unordered_map<std::string, std::vector<int>> cache_;
 };
