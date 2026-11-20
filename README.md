@@ -125,8 +125,9 @@ all of K in one call and would need its own K-blocking there.
 
 These were measured with the matrix-unit kernels taking over at 8 tokens per
 pass, where a batch of 8 was *slower* (391 tok/s) than a batch of 4. The
-threshold has since been raised to 16 (`kTensorMinTokens` in `src/engine.mm`)
-but the sweep has not been re-run, so the 8-16 range is untuned.
+threshold has since been raised to 16 but the sweep has not been re-run, so the
+8-16 range is untuned. It is a runtime option (`--tensor-min N`), so the sweep
+is `for n in 8 12 16 24 32; do build/llm batch -m <model> --tensor-min $n; done`.
 
 ### Speculative decoding
 
@@ -187,6 +188,7 @@ done && cd ../..
 build/llm generate -m models/Qwen2.5-1.5B-Instruct --chat -p "Why is the sky blue?"
 build/llm bench    -m models/Qwen2.5-1.5B-Instruct [--profile] [--f32]
 build/llm batch    -m models/Qwen2.5-1.5B-Instruct --requests 32
+build/llm eval     -m models/Qwen2.5-1.5B-Instruct --file some_text.txt   # int4 vs fp32 quality
 build/llm spec     -m models/Qwen2.5-1.5B-Instruct --draft models/Qwen2.5-0.5B-Instruct
 build/gemm_bench [--half | --half-out] [M N K ...]
 ```
@@ -204,8 +206,11 @@ make test MODEL=models/Qwen2.5-1.5B-Instruct       # + tokenizer and logit parit
 
 ## Known limitations
 
-* int4 output quality has only been checked by reading generations, not by
-  perplexity against the fp32 model or `Q4_K_M`.
+* int4 output quality has only been checked by reading generations. `llm eval`
+  computes perplexity, top-1 agreement and KL against the fp32 engine, but it
+  was added after the benchmark session and has not been run yet.
+* Speculative sampling at temperature > 0 is verified at the level of the
+  acceptance rule (statistical unit test), not end to end through two models.
 * Sharded checkpoints (`model-0000x-of-0000y.safetensors`) are covered by a
   synthetic unit test, not yet by a real multi-file model.
 * The matrix-unit kernels require an M5/A19-class GPU and macOS 26; there is
