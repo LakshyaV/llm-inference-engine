@@ -44,6 +44,7 @@ MODEL ?=
 test: all
 	build/test_kv_pager
 	build/test_quant
+	build/test_safetensors
 ifneq ($(MODEL),)
 	build/test_tokenizer $(MODEL) tests/data/tokenizer_cases.json
 	build/test_logits $(MODEL) tests/data/logits_$(notdir $(MODEL)).bin
