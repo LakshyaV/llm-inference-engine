@@ -22,7 +22,7 @@ prefill: 26 tokens | decode: 16 tokens, 211.1 tok/s
 | Piece | Where | Notes |
 | --- | --- | --- |
 | safetensors loader | `src/safetensors.*`, `src/json.h` | mmap, own JSON parser, F32/F16/BF16, sharded checkpoints |
-| BPE tokenizer | `src/tokenizer.*` | byte-level BPE from `tokenizer.json`; the pre-tokenizer regex is a hand-written matcher with generated Unicode tables |
+| BPE tokenizer | `src/tokenizer.*` | byte-level BPE from `tokenizer.json`; NFC normalization and the pre-tokenizer regex are hand-written on generated Unicode tables |
 | Metal kernels | `src/kernels/model.metal` | embedding, RMSNorm, RoPE, linear layers (fp32 + int4), SwiGLU, attention |
 | Tiled GEMM | `src/kernels/gemm.metal`, `bench/gemm_bench.mm` | naive -> register-tiled -> threadgroup-memory-tiled -> matrix-unit ("tensor core") kernel, benchmarked against MPS |
 | Fused flash attention | `attention_impl` in `model.metal` | QK^T, causal online softmax and PV in one kernel, tiled over keys, no score matrix |
@@ -204,9 +204,6 @@ make test MODEL=models/Qwen2.5-1.5B-Instruct       # + tokenizer and logit parit
 
 ## Known limitations
 
-* The tokenizer skips Unicode NFC normalization (input is assumed to be NFC,
-  which ordinary text is) and treats the regex's case-insensitive contraction
-  rule as ASCII-only. It matched Hugging Face on ~3,800 fuzzed strings.
 * int4 output quality has only been checked by reading generations, not by
   perplexity against the fp32 model or `Q4_K_M`.
 * Sharded checkpoints (`model-0000x-of-0000y.safetensors`) are supported in
