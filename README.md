@@ -197,7 +197,7 @@ The first int4 run quantizes the checkpoint and caches the result next to it
 ## Tests
 
 ```sh
-make test                                          # allocator + quantizer unit tests
+make test                                          # unit tests: allocator, quantizer, safetensors
 python tools/reference.py models/Qwen2.5-1.5B-Instruct tests/data   # needs torch + transformers
 make test MODEL=models/Qwen2.5-1.5B-Instruct       # + tokenizer and logit parity
 ```
@@ -206,8 +206,8 @@ make test MODEL=models/Qwen2.5-1.5B-Instruct       # + tokenizer and logit parit
 
 * int4 output quality has only been checked by reading generations, not by
   perplexity against the fp32 model or `Q4_K_M`.
-* Sharded checkpoints (`model-0000x-of-0000y.safetensors`) are supported in
-  the loader but have not been exercised on a real sharded model.
+* Sharded checkpoints (`model-0000x-of-0000y.safetensors`) are covered by a
+  synthetic unit test, not yet by a real multi-file model.
 * The matrix-unit kernels require an M5/A19-class GPU and macOS 26; there is
   no fallback GEMM path for older hardware in the engine.
 * No chat-template engine: `--chat` hard-codes the ChatML format Qwen uses.
