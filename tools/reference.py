@@ -52,6 +52,11 @@ TOKENIZER_CASES = [
     "CamelCaseAndsnake_case_and-kebab-case ALLCAPS mIxEd",
     "End with space ",
     "Ünïcödé at start, and digits١٢٣ in Arabic-Indic, plus ⅔",
+    # not in NFC: the tokenizer must normalize these
+    "cafe\u0301 nai\u0308ve A\u030angstro\u0308m",
+    "\u212b and \u2126 and \u00c5 are singletons or composites",
+    "\u1112\u1161\u11ab\u1100\u1173\u11af jamo, a\u0323\u0307 q\u0307\u0323 reordering, \u0e4d\u0e32",
+    "<|im_start|>e\u0301<|im_end|>\u0301x",
 ]
 
 PROMPTS = [
