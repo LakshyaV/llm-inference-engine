@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Generate src/unicode_tables.h: code point ranges for \\p{L} and \\p{N}.
+"""Generate src/unicode_tables.h.
 
-The BPE pre-tokenizer regex needs Unicode general categories; rather than link
-ICU we bake the two categories it uses into sorted range tables.
+* code point ranges for \\p{L} and \\p{N} (the BPE pre-tokenizer regex needs
+  Unicode general categories)
+* canonical decompositions, combining classes and primary composites for NFC
+  normalization (the tokenizer's normalizer)
+
+Baking these in avoids linking ICU.
 """
 import sys
 import unicodedata
@@ -44,6 +48,46 @@ def main():
     print(emit("kUnicodeLetterRanges", letters))
     print()
     print(emit("kUnicodeNumberRanges", numbers))
+    print()
+
+    # --- NFC data (Hangul is handled algorithmically and left out) ---
+    hangul = lambda cp: 0xAC00 <= cp <= 0xD7A3
+    decomp, compose = [], []
+    for cp in range(0x110000):
+        d = unicodedata.decomposition(chr(cp))
+        if not d or d.startswith("<") or hangul(cp):
+            continue
+        parts = [int(x, 16) for x in d.split()]
+        decomp.append((cp, parts[0], parts[1] if len(parts) > 1 else 0))
+        # Primary composite: NFC really does recombine the pair (not an exclusion).
+        if len(parts) == 2 and unicodedata.normalize("NFC", chr(parts[0]) + chr(parts[1])) == chr(cp):
+            compose.append((parts[0], parts[1], cp))
+    compose.sort()
+
+    print("// Canonical decompositions: {code point, first, second (0 = singleton)}, sorted by code point.")
+    print("static const uint32_t kUnicodeDecomp[][3] = {")
+    for i in range(0, len(decomp), 4):
+        print("    " + ",".join(f"{{0x{a:X},0x{b:X},0x{c:X}}}" for a, b, c in decomp[i:i + 4]) + ",")
+    print("};\n")
+    print("// Primary composites: {first, second, composed}, sorted by (first, second).")
+    print("static const uint32_t kUnicodeCompose[][3] = {")
+    for i in range(0, len(compose), 4):
+        print("    " + ",".join(f"{{0x{a:X},0x{b:X},0x{c:X}}}" for a, b, c in compose[i:i + 4]) + ",")
+    print("};\n")
+
+    ccc, start = [], None
+    for cp in range(0x110001):
+        c = unicodedata.combining(chr(cp)) if cp < 0x110000 else 0
+        if start is not None and (c != start[1]):
+            ccc.append((start[0], cp - 1, start[1]))
+            start = None
+        if c and start is None:
+            start = (cp, c)
+    print("// Non-zero canonical combining classes: {first, last, class}.")
+    print("static const uint32_t kUnicodeCCC[][3] = {")
+    for i in range(0, len(ccc), 4):
+        print("    " + ",".join(f"{{0x{a:X},0x{b:X},{c}}}" for a, b, c in ccc[i:i + 4]) + ",")
+    print("};")
 
 
 if __name__ == "__main__":

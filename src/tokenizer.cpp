@@ -55,6 +55,136 @@ static uint32_t decode_utf8(std::string_view s, size_t i, size_t& len) {
     return 0xFFFD;
 }
 
+static void append_utf8(std::string& out, uint32_t cp) {
+    if (cp < 0x80) out += (char)cp;
+    else if (cp < 0x800) { out += (char)(0xC0 | (cp >> 6)); out += (char)(0x80 | (cp & 0x3F)); }
+    else if (cp < 0x10000) {
+        out += (char)(0xE0 | (cp >> 12)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F));
+    } else {
+        out += (char)(0xF0 | (cp >> 18)); out += (char)(0x80 | ((cp >> 12) & 0x3F));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F));
+    }
+}
+
+// -------------------------------------------------------------------- NFC --
+//
+// Unicode Normalization Form C: canonical decomposition, canonical ordering
+// of combining marks, then canonical composition. Hangul syllables are
+// handled arithmetically; everything else comes from the generated tables.
+
+namespace {
+
+constexpr uint32_t kSBase = 0xAC00, kLBase = 0x1100, kVBase = 0x1161, kTBase = 0x11A7;
+constexpr uint32_t kLCount = 19, kVCount = 21, kTCount = 28, kNCount = kVCount * kTCount, kSCount = kLCount * kNCount;
+
+uint32_t combining_class(uint32_t cp) {
+    if (cp < 0x300) return 0;
+    size_t lo = 0, hi = sizeof kUnicodeCCC / sizeof kUnicodeCCC[0];
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (cp < kUnicodeCCC[mid][0]) hi = mid;
+        else if (cp > kUnicodeCCC[mid][1]) lo = mid + 1;
+        else return kUnicodeCCC[mid][2];
+    }
+    return 0;
+}
+
+void decompose(uint32_t cp, std::vector<uint32_t>& out) {
+    if (cp >= kSBase && cp < kSBase + kSCount) {
+        const uint32_t s = cp - kSBase;
+        out.push_back(kLBase + s / kNCount);
+        out.push_back(kVBase + (s % kNCount) / kTCount);
+        if (s % kTCount) out.push_back(kTBase + s % kTCount);
+        return;
+    }
+    size_t lo = 0, hi = sizeof kUnicodeDecomp / sizeof kUnicodeDecomp[0];
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (kUnicodeDecomp[mid][0] < cp) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo < sizeof kUnicodeDecomp / sizeof kUnicodeDecomp[0] && kUnicodeDecomp[lo][0] == cp) {
+        decompose(kUnicodeDecomp[lo][1], out);
+        if (kUnicodeDecomp[lo][2]) decompose(kUnicodeDecomp[lo][2], out);
+    } else {
+        out.push_back(cp);
+    }
+}
+
+// Returns the composite of (a, b), or 0 if the pair does not compose.
+uint32_t compose_pair(uint32_t a, uint32_t b) {
+    if (a >= kLBase && a < kLBase + kLCount && b >= kVBase && b < kVBase + kVCount)
+        return kSBase + ((a - kLBase) * kVCount + (b - kVBase)) * kTCount;
+    if (a >= kSBase && a < kSBase + kSCount && (a - kSBase) % kTCount == 0 && b > kTBase && b < kTBase + kTCount)
+        return a + (b - kTBase);
+    size_t lo = 0, hi = sizeof kUnicodeCompose / sizeof kUnicodeCompose[0];
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        const uint32_t* e = kUnicodeCompose[mid];
+        if (e[0] < a || (e[0] == a && e[1] < b)) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo < sizeof kUnicodeCompose / sizeof kUnicodeCompose[0] && kUnicodeCompose[lo][0] == a && kUnicodeCompose[lo][1] == b)
+        return kUnicodeCompose[lo][2];
+    return 0;
+}
+
+}  // namespace
+
+std::string nfc_normalize(std::string_view s) {
+    // Everything below U+0300 is already in NFC; that covers most text.
+    bool maybe = false;
+    for (unsigned char c : s)
+        if (c >= 0xCC) { maybe = true; break; }
+    if (!maybe) return std::string(s);
+
+    std::vector<uint32_t> cps;
+    for (size_t i = 0; i < s.size();) {
+        size_t len;
+        const uint32_t cp = decode_utf8(s, i, len);
+        if (cp == 0xFFFD && len == 1) return std::string(s);  // malformed input: leave the bytes alone
+        decompose(cp, cps);
+        i += len;
+    }
+    // Canonical ordering: stable-sort each run of combining marks by class.
+    std::vector<uint32_t> cls(cps.size());
+    for (size_t i = 0; i < cps.size(); i++) cls[i] = combining_class(cps[i]);
+    for (size_t i = 0; i < cps.size();) {
+        if (!cls[i]) { i++; continue; }
+        size_t j = i;
+        while (j < cps.size() && cls[j]) j++;
+        for (size_t a = i + 1; a < j; a++)  // insertion sort (runs are tiny), stable
+            for (size_t b = a; b > i && cls[b - 1] > cls[b]; b--) {
+                std::swap(cls[b - 1], cls[b]);
+                std::swap(cps[b - 1], cps[b]);
+            }
+        i = j;
+    }
+    // Canonical composition: a mark combines with the last starter unless a
+    // mark of the same or higher class sits in between ("blocked").
+    std::vector<uint32_t> out;
+    size_t starter = SIZE_MAX;
+    uint32_t last_cls = 0;
+    for (size_t i = 0; i < cps.size(); i++) {
+        const uint32_t c = cls[i];
+        if (starter != SIZE_MAX) {
+            const bool adjacent = starter + 1 == out.size();
+            if (adjacent || (last_cls < c && last_cls != 0) ) {
+                if (const uint32_t comp = (c != 0 || adjacent) ? compose_pair(out[starter], cps[i]) : 0) {
+                    out[starter] = comp;
+                    continue;
+                }
+            }
+        }
+        if (c == 0) { starter = out.size(); last_cls = 0; }
+        else last_cls = c;
+        out.push_back(cps[i]);
+    }
+    std::string res;
+    for (uint32_t cp : out) append_utf8(res, cp);
+    return res;
+}
+
 // ------------------------------------------------------------- byte-level --
 
 // GPT-2's byte<->unicode table: printable bytes map to themselves, the rest
@@ -141,6 +271,16 @@ Tokenizer::Tokenizer(const std::string& path) {
         if (!a.content.empty()) added_first_[(unsigned char)a.content[0]] = true;
     std::sort(added_.begin(), added_.end(),
               [](const Added& x, const Added& y) { return x.content.size() > y.content.size(); });
+
+    // Normalizer: NFC is the only one the supported models use.
+    if (auto* norm = root.find("normalizer")) {
+        auto is_nfc = [](const json::Value& n) { auto* t = n.find("type"); return t && t->str == "NFC"; };
+        if (norm->is_object()) {
+            nfc_ = is_nfc(*norm);
+            if (auto* seq = norm->find("normalizers"))
+                for (auto& n : seq->arr) nfc_ = nfc_ || is_nfc(n);
+        }
+    }
 
     // Llama-3 groups digits as \p{N}{1,3}; Qwen / GPT-2 emit one digit per pre-token.
     if (auto* pre = root.find("pre_tokenizer")) {
@@ -302,7 +442,12 @@ void Tokenizer::bpe(std::string_view word, std::vector<int>& out) const {
 std::vector<int> Tokenizer::encode(std::string_view text) const {
     std::vector<int> ids;
     auto encode_plain = [&](std::string_view chunk) {
-        for (auto w : pretokenize(chunk)) bpe(w, ids);
+        if (!nfc_) {
+            for (auto w : pretokenize(chunk)) bpe(w, ids);
+            return;
+        }
+        const std::string norm = nfc_normalize(chunk);
+        for (auto w : pretokenize(norm)) bpe(w, ids);
     };
     size_t start = 0, i = 0;
     while (i < text.size()) {
