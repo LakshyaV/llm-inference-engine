@@ -197,7 +197,7 @@ The first int4 run quantizes the checkpoint and caches the result next to it
 ## Tests
 
 ```sh
-make test                                          # unit tests: allocator, quantizer, safetensors
+make test                                          # unit tests: allocator, quantizer, safetensors, speculative sampling
 python tools/reference.py models/Qwen2.5-1.5B-Instruct tests/data   # needs torch + transformers
 make test MODEL=models/Qwen2.5-1.5B-Instruct       # + tokenizer and logit parity
 ```
