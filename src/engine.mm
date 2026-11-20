@@ -23,7 +23,6 @@ struct KVArgs {
 };
 
 enum { kStore = 0, kAccumulate = 1, kSwiGLU = 2 };
-constexpr uint32_t kTensorMinTokens = 16;
 
 // One forward pass = one command buffer with one compute encoder. In profile
 // mode every stage gets its own command buffer so GPU time can be attributed.
@@ -268,7 +267,7 @@ struct Engine::Impl {
         // The matrix units work on 64-token tiles, so they only pay off once a
         // pass carries enough tokens to fill a good part of one; below that the
         // SIMD-group dot-product kernels are faster.
-        const bool tensor = n >= kTensorMinTokens;
+        const bool tensor = n >= (uint32_t)opt.tensor_min_tokens;
         const uint32_t nt = n > 1 ? 4 : 1;
         const uint32_t nr = 2;
         MMArgs a = {n, rows, L.K, x_stride, y_stride, 0, (uint32_t)mode, L.bias != nil};
