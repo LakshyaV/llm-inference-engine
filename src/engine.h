@@ -23,6 +23,7 @@ struct EngineOptions {
     int max_batch_tokens = 1024; // tokens per forward() call
     int max_logit_rows = 64;     // logit rows returned per forward() call
     int max_positions = 8192;    // longest sequence (RoPE table size)
+    int tensor_min_tokens = 16;  // passes with at least this many tokens use the matrix-unit kernels
     bool verbose = false;
     bool profile = false;        // time each kernel class separately (slower)
 };

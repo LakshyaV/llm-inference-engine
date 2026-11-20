@@ -3,7 +3,12 @@
 //   llm generate -m <model_dir> -p "prompt" [-n 128] [--chat] [--f32] [--temp 0.7 --top-k 40 --top-p 0.95]
 //   llm bench    -m <model_dir> [-n 128] [--prompt-tokens 512] [--ctx 1] [--profile] [--f32]
 //   llm batch    -m <model_dir> [--requests 16] [--max-active 8] [-n 96] [--arrival-ms 0]
+//
+// Common: --f32 (exact weights), --tensor-min N (token count at which linear
+// layers switch to the matrix-unit kernels; default 16).
+//   llm eval     -m <model_dir> --file text.txt [--ctx 256] [--max-chunks 8]
 //   llm spec     -m <target_dir> --draft <draft_dir> [-p "prompt"] [--gamma 4] [-n 128] [--temp 0]
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <unistd.h>
@@ -50,6 +55,7 @@ static EngineOptions engine_options(const Args& a) {
     o.format = a.flag("f32") ? WeightFormat::F32 : WeightFormat::Q4;
     o.verbose = true;
     o.profile = a.flag("profile");
+    o.tensor_min_tokens = a.num("tensor-min", o.tensor_min_tokens);
     return o;
 }
 
@@ -224,6 +230,79 @@ static int cmd_batch(const Args& a) {
     return 0;
 }
 
+// int4 quality check: perplexity of the fp32 and int4 engines on the same
+// text, plus how often they agree on the top token and the mean KL divergence
+// between their next-token distributions.
+//
+// Protocol (the one llama.cpp's perplexity tool uses): the text is cut into
+// chunks of --ctx tokens and only the second half of each chunk is scored, so
+// every scored token has at least ctx/2 tokens of context.
+static int cmd_eval(const Args& a) {
+    const std::string dir = a.str("model");
+    if (!a.flag("file")) die("eval: --file <text file> is required");
+    Tokenizer tok(dir + "/tokenizer.json");
+    const std::vector<int> ids = tok.encode(read_file(a.str("file")));
+    const int ctx = a.num("ctx", 256), first = ctx / 2;
+    const int n_chunks = std::min((int)ids.size() / ctx, a.num("max-chunks", 8));
+    if (n_chunks < 1) die("eval: need at least %d tokens of text, got %zu", ctx, ids.size());
+
+    EngineOptions eo = engine_options(a);
+    eo.max_logit_rows = ctx - first;
+    eo.max_batch_tokens = std::max(eo.max_batch_tokens, ctx);
+    eo.format = WeightFormat::F32;
+    Engine ref(dir, eo);
+    eo.format = WeightFormat::Q4;
+    Engine q4(dir, eo);
+    const int V = ref.config().vocab_size;
+
+    // log-softmax of one row, in double precision
+    auto log_softmax = [V](const float* row, std::vector<double>& out) {
+        double mx = row[0];
+        for (int i = 1; i < V; i++) mx = std::max(mx, (double)row[i]);
+        double sum = 0;
+        for (int i = 0; i < V; i++) sum += std::exp(row[i] - mx);
+        const double lse = mx + std::log(sum);
+        out.resize(V);
+        for (int i = 0; i < V; i++) out[i] = row[i] - lse;
+    };
+
+    double nll_ref = 0, nll_q4 = 0, kl = 0;
+    long scored = 0, agree = 0;
+    std::vector<double> lp_ref, lp_q4;
+    for (int c = 0; c < n_chunks; c++) {
+        std::vector<TokenIn> toks;
+        std::vector<int> want;
+        for (int t = 0; t < ctx; t++) toks.push_back({ids[(size_t)c * ctx + t], 0});
+        for (int t = first; t < ctx - 1; t++) want.push_back(t);  // row for position t predicts token t + 1
+
+        const int s_ref = ref.seq_create(), s_q4 = q4.seq_create();
+        for (auto& t : toks) t.seq = s_ref;
+        const float* l_ref = ref.forward(toks, want);
+        for (auto& t : toks) t.seq = s_q4;
+        const float* l_q4 = q4.forward(toks, want);
+
+        for (size_t r = 0; r < want.size(); r++) {
+            const int target = ids[(size_t)c * ctx + want[r] + 1];
+            log_softmax(l_ref + r * (size_t)V, lp_ref);
+            log_softmax(l_q4 + r * (size_t)V, lp_q4);
+            nll_ref -= lp_ref[target];
+            nll_q4 -= lp_q4[target];
+            for (int i = 0; i < V; i++) kl += std::exp(lp_ref[i]) * (lp_ref[i] - lp_q4[i]);
+            agree += argmax(l_ref + r * (size_t)V, V) == argmax(l_q4 + r * (size_t)V, V);
+            scored++;
+        }
+        ref.seq_free(s_ref);
+        q4.seq_free(s_q4);
+    }
+    printf("%ld tokens scored (%d chunks of %d, second half of each)\n", scored, n_chunks, ctx);
+    printf("perplexity  fp32: %8.4f\n", std::exp(nll_ref / scored));
+    printf("perplexity  int4: %8.4f  (%+.2f%%)\n", std::exp(nll_q4 / scored),
+           100.0 * (std::exp(nll_q4 / scored) / std::exp(nll_ref / scored) - 1.0));
+    printf("top-1 agreement:  %7.2f%%\n", 100.0 * agree / scored);
+    printf("mean KL(fp32 || int4): %.5f nats\n", kl / scored);
+    return 0;
+}
+
 static int cmd_spec(const Args& a) {
     const std::string dir = a.str("model"), ddir = a.str("draft");
     if (ddir.empty()) die("spec: --draft <model_dir> is required");
@@ -295,8 +374,9 @@ int main(int argc, char** argv) {
         if (a.cmd == "generate") return cmd_generate(a);
         if (a.cmd == "bench") return cmd_bench(a);
         if (a.cmd == "batch") return cmd_batch(a);
+        if (a.cmd == "eval") return cmd_eval(a);
         if (a.cmd == "spec") return cmd_spec(a);
-        fprintf(stderr, "usage: llm <generate|bench|batch|spec> -m <model_dir> [options]\n");
+        fprintf(stderr, "usage: llm <generate|bench|batch|eval|spec> -m <model_dir> [options]\n");
         return 2;
     } catch (const std::exception& e) {
         fprintf(stderr, "error: %s\n", e.what());
